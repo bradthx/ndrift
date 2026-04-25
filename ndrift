@@ -1,0 +1,1236 @@
+#!/usr/bin/env python3
+"""ndrift is a lightweight file integrity monitor for Linux."""
+
+import argparse
+import configparser
+import datetime as dt
+import fnmatch
+import getpass
+import grp
+import hashlib
+import hmac
+import json
+import logging
+import logging.handlers
+import os
+import pathlib
+import pwd
+import secrets
+import signal
+import stat
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+
+EXIT_OK = 0
+EXIT_CHANGES = 1
+EXIT_ERROR = 2
+BASELINE_VERSION = 1
+DEFAULT_CONFIG_PATH = "/etc/ndrift/ndrift.conf"
+SIG_ALGO = "hmac-sha256"
+SIZE_LIMIT_SENTINEL = "__SIZE_LIMIT__"
+SECTION_NAME = "ndrift"
+
+
+class NdriftError(Exception):
+    """Represents an expected ndrift runtime failure."""
+
+
+@dataclass
+class NdriftConfig:
+    """Stores typed configuration values for ndrift."""
+
+    config_path: str
+    directories: List[str]
+    include_patterns: List[str]
+    exclude_patterns: List[str]
+    baseline_path: str
+    signature_path: str
+    signature_key_path: str
+    state_path: str
+    last_report_path: str
+    log_path: str
+    log_max_bytes: int
+    log_backup_count: int
+    follow_symlinks: bool
+    max_file_size_mb: int
+    hash_on_metadata_change_only: bool
+    throttle_ms: int
+    cron_schedule: str
+    email_to: str
+    smtp_host: str
+    slack_webhook: str
+    s3_bucket: str
+    allow_read_errors: bool
+    scan_updates_baseline: bool
+
+
+def utc_now() -> str:
+    """Returns current UTC time in ISO format."""
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def parse_bool(value: str) -> bool:
+    """Converts common boolean strings into a bool."""
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_csv(value: str) -> List[str]:
+    """Parses a comma separated string into trimmed items."""
+    if not value.strip():
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def normalize_path(path: str) -> str:
+    """Expands and normalizes a path to absolute form."""
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def resolve_config_relative_path(config_path: str, value: str) -> str:
+    """Resolves a config value path relative to config location."""
+    expanded = os.path.expanduser(value)
+    if os.path.isabs(expanded):
+        return normalize_path(expanded)
+    base = os.path.dirname(normalize_path(config_path))
+    return normalize_path(os.path.join(base, expanded))
+
+
+def ensure_parent_dir(path: str) -> None:
+    """Creates the parent directory for a path when needed."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def atomic_write_text(path: str, content: str, mode: int = 0o600) -> None:
+    """Writes text atomically with restrictive default permissions."""
+    ensure_parent_dir(path)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    os.chmod(tmp_path, mode)
+    os.replace(tmp_path, path)
+
+
+def atomic_write_bytes(path: str, content: bytes, mode: int = 0o600) -> None:
+    """Writes bytes atomically with restrictive default permissions."""
+    ensure_parent_dir(path)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, "wb") as handle:
+        handle.write(content)
+    os.chmod(tmp_path, mode)
+    os.replace(tmp_path, path)
+
+
+def file_sha256(path: str) -> str:
+    """Calculates SHA256 for a file."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def data_sha256(data: bytes) -> str:
+    """Calculates SHA256 for bytes."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def setup_logger(config: NdriftConfig) -> logging.Logger:
+    """Creates a console and rotating file logger."""
+    logger = logging.getLogger("ndrift")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+    stream_handler = logging.StreamHandler(sys.stderr)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    ensure_parent_dir(config.log_path)
+    file_handler = logging.handlers.RotatingFileHandler(
+        config.log_path,
+        maxBytes=config.log_max_bytes,
+        backupCount=config.log_backup_count,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    return logger
+
+
+def default_config_values(config_path: str) -> Dict[str, str]:
+    """Builds default config values for recommended system paths."""
+    return {
+        "directories": "",
+        "include_patterns": "*.php,*.js,*.html,*.css",
+        "exclude_patterns": "cache/,logs/,uploads/tmp/,.git/",
+        "baseline_path": "/var/lib/ndrift/ndrift-baseline.json",
+        "signature_path": "/var/lib/ndrift/ndrift-baseline.json.sig",
+        "signature_key_path": "/var/lib/ndrift/ndrift-baseline.key",
+        "state_path": "/var/lib/ndrift/ndrift-state.json",
+        "last_report_path": "/var/lib/ndrift/ndrift-report.json",
+        "log_path": "/var/log/ndrift/ndrift.log",
+        "log_max_bytes": "1048576",
+        "log_backup_count": "5",
+        "follow_symlinks": "false",
+        "max_file_size_mb": "50",
+        "hash_on_metadata_change_only": "true",
+        "throttle_ms": "0",
+        "cron_schedule": "*/5 * * * *",
+        "email_to": "",
+        "smtp_host": "localhost",
+        "slack_webhook": "",
+        "s3_bucket": "",
+        "allow_read_errors": "false",
+        "scan_updates_baseline": "false",
+    }
+
+
+def write_config_file(config_path: str, directories: Optional[List[str]] = None) -> None:
+    """Writes a config file using defaults and optional directories."""
+    defaults = default_config_values(config_path)
+    if directories is not None:
+        defaults["directories"] = ",".join(normalize_path(item) for item in directories)
+    parser = configparser.ConfigParser()
+    parser[SECTION_NAME] = defaults
+    ensure_parent_dir(config_path)
+    with open(config_path, "w", encoding="utf-8") as handle:
+        parser.write(handle)
+    os.chmod(config_path, 0o600)
+
+
+def update_config_directories(config_path: str, directories: List[str]) -> None:
+    """Updates only monitored directories in an existing config file."""
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+    if SECTION_NAME not in parser:
+        parser[SECTION_NAME] = default_config_values(config_path)
+    parser[SECTION_NAME]["directories"] = ",".join(normalize_path(item) for item in directories)
+    with open(config_path, "w", encoding="utf-8") as handle:
+        parser.write(handle)
+    os.chmod(config_path, 0o600)
+
+
+def load_config(config_path: str) -> NdriftConfig:
+    """Loads and validates config values."""
+    config_path = normalize_path(config_path)
+    if not os.path.exists(config_path):
+        raise NdriftError(f"Config file is missing: {config_path}")
+    parser = configparser.ConfigParser()
+    parser.read(config_path, encoding="utf-8")
+    defaults = default_config_values(config_path)
+    section = parser[SECTION_NAME] if SECTION_NAME in parser else {}
+
+    def get_value(key: str) -> str:
+        raw = section.get(key, defaults[key])
+        return str(raw)
+
+    directories = [normalize_path(item) for item in parse_csv(get_value("directories"))]
+    include_patterns = parse_csv(get_value("include_patterns"))
+    exclude_patterns = parse_csv(get_value("exclude_patterns"))
+    baseline_path = resolve_config_relative_path(config_path, get_value("baseline_path"))
+    signature_path = resolve_config_relative_path(config_path, get_value("signature_path"))
+    signature_key_path = resolve_config_relative_path(config_path, get_value("signature_key_path"))
+    state_path = resolve_config_relative_path(config_path, get_value("state_path"))
+    last_report_path = resolve_config_relative_path(config_path, get_value("last_report_path"))
+    log_path = resolve_config_relative_path(config_path, get_value("log_path"))
+
+    config = NdriftConfig(
+        config_path=config_path,
+        directories=directories,
+        include_patterns=include_patterns,
+        exclude_patterns=exclude_patterns,
+        baseline_path=baseline_path,
+        signature_path=signature_path,
+        signature_key_path=signature_key_path,
+        state_path=state_path,
+        last_report_path=last_report_path,
+        log_path=log_path,
+        log_max_bytes=int(get_value("log_max_bytes")),
+        log_backup_count=int(get_value("log_backup_count")),
+        follow_symlinks=parse_bool(get_value("follow_symlinks")),
+        max_file_size_mb=int(get_value("max_file_size_mb")),
+        hash_on_metadata_change_only=parse_bool(get_value("hash_on_metadata_change_only")),
+        throttle_ms=int(get_value("throttle_ms")),
+        cron_schedule=get_value("cron_schedule"),
+        email_to=get_value("email_to"),
+        smtp_host=get_value("smtp_host"),
+        slack_webhook=get_value("slack_webhook"),
+        s3_bucket=get_value("s3_bucket"),
+        allow_read_errors=parse_bool(get_value("allow_read_errors")),
+        scan_updates_baseline=parse_bool(get_value("scan_updates_baseline")),
+    )
+    return config
+
+
+def assert_scan_directories(directories: List[str]) -> None:
+    """Ensures at least one scan directory exists."""
+    if not directories:
+        raise NdriftError("No monitored directories are configured")
+    for directory in directories:
+        if not os.path.exists(directory):
+            raise NdriftError(f"Scan path is missing: {directory}")
+        if not os.path.isdir(directory):
+            raise NdriftError(f"Scan path is not a directory: {directory}")
+
+
+def path_is_within(child: str, parent: str) -> bool:
+    """Checks whether child path is inside parent path."""
+    child_norm = normalize_path(child)
+    parent_norm = normalize_path(parent)
+    try:
+        return os.path.commonpath([child_norm, parent_norm]) == parent_norm
+    except ValueError:
+        return False
+
+
+def maybe_warn_baseline_location(config: NdriftConfig, directories: List[str]) -> List[str]:
+    """Returns warnings when baseline location is inside monitored roots."""
+    warnings: List[str] = []
+    for directory in directories:
+        if path_is_within(config.baseline_path, directory):
+            warnings.append(
+                f"Baseline path {config.baseline_path} is inside monitored directory {directory}"
+            )
+    return warnings
+
+
+def load_or_create_key(path: str) -> bytes:
+    """Loads signature key from disk or creates a new key."""
+    if os.path.exists(path):
+        with open(path, "rb") as handle:
+            key = handle.read()
+        if not key:
+            raise NdriftError(f"Signature key is empty: {path}")
+        return key
+    ensure_parent_dir(path)
+    key = secrets.token_bytes(32)
+    atomic_write_bytes(path, key, mode=0o600)
+    return key
+
+
+def sign_payload(payload: bytes, key: bytes) -> str:
+    """Signs payload with HMAC SHA256."""
+    return hmac.new(key, payload, hashlib.sha256).hexdigest()
+
+
+def verify_payload_signature(payload: bytes, key: bytes, signature_hex: str) -> bool:
+    """Verifies payload signature using constant time compare."""
+    expected = sign_payload(payload, key)
+    return hmac.compare_digest(expected, signature_hex.strip())
+
+
+def get_file_attrs(path: str) -> str:
+    """Reads lsattr data for a file path when available."""
+    try:
+        proc = subprocess.run(
+            ["lsattr", "-d", path],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    line = proc.stdout.strip()
+    if not line:
+        return ""
+    return line.split()[0]
+
+
+def owner_name(uid: int) -> str:
+    """Returns user name for uid when possible."""
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def group_name(gid: int) -> str:
+    """Returns group name for gid when possible."""
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return str(gid)
+
+
+def should_exclude(rel_path: str, patterns: List[str]) -> bool:
+    """Checks whether relative path matches exclude patterns."""
+    rel_posix = rel_path.replace(os.sep, "/")
+    base = os.path.basename(rel_posix)
+    for pattern in patterns:
+        check = pattern.strip()
+        if not check:
+            continue
+        if check.endswith("/"):
+            prefix = check.rstrip("/") + "/"
+            if rel_posix.startswith(prefix) or rel_posix == check.rstrip("/"):
+                return True
+        else:
+            if fnmatch.fnmatch(rel_posix, check) or fnmatch.fnmatch(base, check):
+                return True
+    return False
+
+
+def should_include(rel_path: str, patterns: List[str]) -> bool:
+    """Checks whether relative path matches include patterns."""
+    if not patterns:
+        return True
+    rel_posix = rel_path.replace(os.sep, "/")
+    base = os.path.basename(rel_posix)
+    for pattern in patterns:
+        check = pattern.strip()
+        if not check:
+            continue
+        if fnmatch.fnmatch(rel_posix, check) or fnmatch.fnmatch(base, check):
+            return True
+    return False
+
+
+def snapshot_dirs(
+    directories: List[str],
+    config: NdriftConfig,
+    previous_entries: Optional[Dict[str, Dict[str, Any]]],
+    logger: logging.Logger,
+) -> Tuple[Dict[str, Dict[str, Any]], List[str], List[str], Dict[str, int]]:
+    """Builds a file metadata snapshot for configured directories."""
+    entries: Dict[str, Dict[str, Any]] = {}
+    warnings: List[str] = []
+    errors: List[str] = []
+    stats: Dict[str, int] = {"hashed": 0, "reused": 0, "size_limited": 0, "scanned": 0}
+    previous_entries = previous_entries or {}
+    max_size_bytes = max(config.max_file_size_mb, 0) * 1024 * 1024
+
+    for root in directories:
+        root_abs = normalize_path(root)
+        for current_root, dirnames, filenames in os.walk(
+            root_abs,
+            topdown=True,
+            followlinks=config.follow_symlinks,
+        ):
+            if not config.follow_symlinks:
+                kept_dirs: List[str] = []
+                for item in dirnames:
+                    full = os.path.join(current_root, item)
+                    if os.path.islink(full):
+                        continue
+                    rel = os.path.relpath(full, root_abs)
+                    if should_exclude(rel, config.exclude_patterns):
+                        continue
+                    kept_dirs.append(item)
+                dirnames[:] = kept_dirs
+            else:
+                dirnames[:] = [
+                    item
+                    for item in dirnames
+                    if not should_exclude(os.path.relpath(os.path.join(current_root, item), root_abs), config.exclude_patterns)
+                ]
+
+            for file_name in filenames:
+                full_path = os.path.join(current_root, file_name)
+                rel_path = os.path.relpath(full_path, root_abs)
+                if should_exclude(rel_path, config.exclude_patterns):
+                    continue
+                if not should_include(rel_path, config.include_patterns):
+                    continue
+
+                try:
+                    st = os.lstat(full_path)
+                    if stat.S_ISLNK(st.st_mode) and not config.follow_symlinks:
+                        continue
+
+                    path_key = normalize_path(full_path)
+                    mode = format(stat.S_IMODE(st.st_mode), "04o")
+                    owner = owner_name(st.st_uid)
+                    group = group_name(st.st_gid)
+                    attrs = get_file_attrs(full_path)
+
+                    previous = previous_entries.get(path_key)
+                    can_reuse_hash = (
+                        config.hash_on_metadata_change_only
+                        and previous is not None
+                        and previous.get("size") == st.st_size
+                        and previous.get("mtime_ns") == st.st_mtime_ns
+                        and isinstance(previous.get("sha256"), str)
+                    )
+
+                    if can_reuse_hash:
+                        sha256 = str(previous.get("sha256"))
+                        stats["reused"] += 1
+                    else:
+                        if max_size_bytes and st.st_size > max_size_bytes:
+                            sha256 = SIZE_LIMIT_SENTINEL
+                            stats["size_limited"] += 1
+                        else:
+                            sha256 = file_sha256(full_path)
+                            stats["hashed"] += 1
+
+                    entries[path_key] = {
+                        "path": path_key,
+                        "size": st.st_size,
+                        "mtime_ns": st.st_mtime_ns,
+                        "sha256": sha256,
+                        "mode": mode,
+                        "uid": st.st_uid,
+                        "gid": st.st_gid,
+                        "owner": owner,
+                        "group": group,
+                        "attrs": attrs,
+                    }
+                    stats["scanned"] += 1
+
+                    if config.throttle_ms > 0:
+                        time.sleep(config.throttle_ms / 1000.0)
+                except PermissionError as exc:
+                    message = f"Permission denied: {full_path}: {exc}"
+                    errors.append(message)
+                    logger.error(message)
+                except OSError as exc:
+                    message = f"Scan failed for {full_path}: {exc}"
+                    errors.append(message)
+                    logger.error(message)
+
+    return entries, warnings, errors, stats
+
+
+def compare_snapshots(
+    baseline_entries: Dict[str, Dict[str, Any]],
+    current_entries: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Compares baseline and current snapshots to produce findings."""
+    findings: List[Dict[str, Any]] = []
+    baseline_paths = set(baseline_entries)
+    current_paths = set(current_entries)
+
+    for path in sorted(current_paths - baseline_paths):
+        findings.append({"type": "ADDED", "path": path, "detail": ""})
+    for path in sorted(baseline_paths - current_paths):
+        findings.append({"type": "DELETED", "path": path, "detail": ""})
+
+    for path in sorted(current_paths & baseline_paths):
+        old = baseline_entries[path]
+        new = current_entries[path]
+        old_hash = str(old.get("sha256", ""))
+        new_hash = str(new.get("sha256", ""))
+
+        if old.get("mode") != new.get("mode"):
+            findings.append(
+                {
+                    "type": "MOD_PERMS",
+                    "path": path,
+                    "detail": f"{old.get('mode')} -> {new.get('mode')}",
+                }
+            )
+
+        old_owner = f"{old.get('owner')}:{old.get('group')}"
+        new_owner = f"{new.get('owner')}:{new.get('group')}"
+        if old_owner != new_owner:
+            findings.append(
+                {
+                    "type": "MOD_OWNER",
+                    "path": path,
+                    "detail": f"{old_owner} -> {new_owner}",
+                }
+            )
+
+        if str(old.get("attrs", "")) != str(new.get("attrs", "")):
+            findings.append(
+                {
+                    "type": "MOD_ATTR",
+                    "path": path,
+                    "detail": f"{old.get('attrs')} -> {new.get('attrs')}",
+                }
+            )
+
+        if old_hash != new_hash:
+            findings.append({"type": "MODIFIED", "path": path, "detail": "hash changed"})
+        else:
+            if (
+                old.get("mtime_ns") != new.get("mtime_ns")
+                and old.get("size") == new.get("size")
+                and old_hash not in {"", SIZE_LIMIT_SENTINEL}
+            ):
+                findings.append(
+                    {
+                        "type": "MOD_TIME",
+                        "path": path,
+                        "detail": f"{old.get('mtime_ns')} -> {new.get('mtime_ns')}",
+                    }
+                )
+
+    return findings
+
+
+def baseline_to_bytes(baseline_data: Dict[str, Any]) -> bytes:
+    """Serializes baseline data in stable JSON form."""
+    return json.dumps(baseline_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def write_baseline(config: NdriftConfig, baseline_data: Dict[str, Any]) -> None:
+    """Writes baseline file and detached signature file."""
+    key = load_or_create_key(config.signature_key_path)
+    payload = baseline_to_bytes(baseline_data)
+    signature = sign_payload(payload, key)
+    atomic_write_text(config.baseline_path, payload.decode("utf-8"), mode=0o600)
+    atomic_write_text(config.signature_path, signature + "\n", mode=0o600)
+
+
+def verify_baseline_signature(config: NdriftConfig) -> None:
+    """Verifies baseline signature and raises on failure."""
+    if not os.path.exists(config.baseline_path):
+        raise NdriftError(f"Cannot read baseline: {config.baseline_path}")
+    if not os.path.exists(config.signature_path):
+        raise NdriftError(f"Cannot verify signature, file is missing: {config.signature_path}")
+    key = load_or_create_key(config.signature_key_path)
+    with open(config.baseline_path, "rb") as baseline_file:
+        payload = baseline_file.read()
+    with open(config.signature_path, "r", encoding="utf-8") as sig_file:
+        signature = sig_file.read().strip()
+    if not signature:
+        raise NdriftError("Cannot verify signature, signature file is empty")
+    if not verify_payload_signature(payload, key, signature):
+        raise NdriftError("Cannot verify signature, baseline integrity failed")
+
+
+def load_baseline(config: NdriftConfig) -> Dict[str, Any]:
+    """Loads baseline data after signature verification."""
+    verify_baseline_signature(config)
+    with open(config.baseline_path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise NdriftError("Baseline data is invalid")
+    if int(data.get("version", 0)) != BASELINE_VERSION:
+        raise NdriftError("Baseline version is not supported")
+    if not isinstance(data.get("files"), dict):
+        raise NdriftError("Baseline file list is invalid")
+    return data
+
+
+def default_state() -> Dict[str, Any]:
+    """Returns default deployment state object."""
+    return {
+        "deploy": {"active": False, "started_at": "", "started_by": ""},
+        "approvals": [],
+        "audit": [],
+    }
+
+
+def load_state(config: NdriftConfig) -> Dict[str, Any]:
+    """Loads state JSON or creates defaults."""
+    if not os.path.exists(config.state_path):
+        return default_state()
+    with open(config.state_path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise NdriftError("State file is invalid")
+    merged = default_state()
+    merged.update(data)
+    if not isinstance(merged.get("deploy"), dict):
+        merged["deploy"] = default_state()["deploy"]
+    if not isinstance(merged.get("approvals"), list):
+        merged["approvals"] = []
+    if not isinstance(merged.get("audit"), list):
+        merged["audit"] = []
+    return merged
+
+
+def save_state(config: NdriftConfig, state_data: Dict[str, Any]) -> None:
+    """Writes deployment state JSON to disk."""
+    atomic_write_text(config.state_path, json.dumps(state_data, indent=2, sort_keys=True) + "\n", mode=0o600)
+
+
+def add_audit_event(state_data: Dict[str, Any], event: str, details: Dict[str, Any]) -> None:
+    """Appends an audit event to state data."""
+    state_data.setdefault("audit", [])
+    state_data["audit"].append(
+        {
+            "time": utc_now(),
+            "user": getpass.getuser(),
+            "event": event,
+            "details": details,
+        }
+    )
+
+
+def write_report(config: NdriftConfig, report: Dict[str, Any]) -> None:
+    """Persists last report JSON for report command."""
+    atomic_write_text(config.last_report_path, json.dumps(report, indent=2, sort_keys=True) + "\n", mode=0o600)
+
+
+def summarize_findings(findings: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Counts findings by type."""
+    summary: Dict[str, int] = {}
+    for finding in findings:
+        kind = str(finding.get("type", "UNKNOWN"))
+        summary[kind] = summary.get(kind, 0) + 1
+    return dict(sorted(summary.items()))
+
+
+def format_finding(finding: Dict[str, Any]) -> str:
+    """Formats a finding as console output."""
+    kind = str(finding.get("type", "UNKNOWN"))
+    path = str(finding.get("path", ""))
+    detail = str(finding.get("detail", "")).strip()
+    if detail:
+        return f"[{kind}] {path} {detail}"
+    return f"[{kind}] {path}"
+
+
+def print_report_console(report: Dict[str, Any]) -> None:
+    """Prints report data in human readable form."""
+    findings = report.get("findings", [])
+    warnings = report.get("warnings", [])
+    errors = report.get("errors", [])
+
+    for finding in findings:
+        print(format_finding(finding))
+    for warning in warnings:
+        print(f"[WARN] {warning}")
+    for error in errors:
+        print(f"[ERROR] {error}")
+
+    if not findings and not warnings and not errors:
+        print("No changes detected")
+
+    summary = report.get("summary", {})
+    if summary:
+        print(json.dumps(summary, sort_keys=True))
+
+
+def send_slack_alert(webhook_url: str, report: Dict[str, Any], logger: logging.Logger) -> None:
+    """Sends a Slack webhook alert for findings or errors."""
+    if not webhook_url:
+        return
+    message = {
+        "text": (
+            f"ndrift alert at {report.get('time')} with "
+            f"{len(report.get('findings', []))} findings and {len(report.get('errors', []))} errors"
+        )
+    }
+    data = json.dumps(message).encode("utf-8")
+    request = urllib.request.Request(
+        webhook_url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        urllib.request.urlopen(request, timeout=5)
+    except urllib.error.URLError as exc:
+        logger.error("Slack alert failed: %s", exc)
+
+
+def send_email_alert(email_to: str, report: Dict[str, Any], smtp_host: str, logger: logging.Logger) -> None:
+    """Sends email alert by local SMTP server."""
+    if not email_to:
+        return
+    try:
+        import smtplib
+        from email.message import EmailMessage
+    except Exception as exc:
+        logger.error("Email modules unavailable: %s", exc)
+        return
+
+    message = EmailMessage()
+    message["Subject"] = "ndrift alert"
+    message["From"] = f"ndrift@{os.uname().nodename}"
+    message["To"] = email_to
+    message.set_content(json.dumps(report, indent=2, sort_keys=True))
+    try:
+        with smtplib.SMTP(smtp_host, timeout=5) as smtp:
+            smtp.send_message(message)
+    except Exception as exc:
+        logger.error("Email alert failed: %s", exc)
+
+
+def send_s3_report(s3_bucket: str, report_path: str, logger: logging.Logger) -> None:
+    """Uploads report file to object storage by AWS CLI when configured."""
+    if not s3_bucket:
+        return
+    key_name = f"ndrift-reports/{pathlib.Path(report_path).name}.{int(time.time())}.json"
+    command = ["aws", "s3", "cp", report_path, f"s3://{s3_bucket}/{key_name}"]
+    try:
+        proc = subprocess.run(command, check=False, capture_output=True, text=True)
+    except FileNotFoundError:
+        logger.error("AWS CLI is missing, cannot upload report")
+        return
+    if proc.returncode != 0:
+        logger.error("S3 upload failed: %s", proc.stderr.strip())
+
+
+def maybe_send_alerts(config: NdriftConfig, report: Dict[str, Any], logger: logging.Logger) -> None:
+    """Sends configured integrations on findings or errors."""
+    findings = report.get("findings", [])
+    errors = report.get("errors", [])
+    if not findings and not errors:
+        return
+    send_slack_alert(config.slack_webhook, report, logger)
+    send_email_alert(config.email_to, report, config.smtp_host, logger)
+    send_s3_report(config.s3_bucket, config.last_report_path, logger)
+
+
+def check_program_security(script_path: str) -> List[str]:
+    """Checks install security posture for script path."""
+    warnings: List[str] = []
+    try:
+        st = os.stat(script_path)
+    except OSError as exc:
+        return [f"Program integrity check failed: {exc}"]
+
+    if st.st_uid != 0:
+        warnings.append("Program owner is not root")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        warnings.append("Program path is writable by group or others")
+
+    parent = os.path.dirname(script_path)
+    try:
+        parent_st = os.stat(parent)
+        if parent_st.st_mode & stat.S_IWOTH:
+            warnings.append("Program directory is writable by others")
+    except OSError as exc:
+        warnings.append(f"Program directory check failed: {exc}")
+
+    return warnings
+
+
+def resolve_scan_dirs(config: NdriftConfig, cli_dirs: Optional[List[str]]) -> List[str]:
+    """Resolves scan directories from CLI or config."""
+    if cli_dirs:
+        return [normalize_path(item) for item in cli_dirs]
+    return [normalize_path(item) for item in config.directories]
+
+
+def build_baseline_data(
+    directories: List[str],
+    config: NdriftConfig,
+    files: Dict[str, Dict[str, Any]],
+    reason: str,
+) -> Dict[str, Any]:
+    """Builds baseline JSON structure."""
+    script_path = normalize_path(os.path.realpath(__file__))
+    config_hash = file_sha256(config.config_path)
+    program_hash = file_sha256(script_path)
+    return {
+        "version": BASELINE_VERSION,
+        "time": utc_now(),
+        "signature_algo": SIG_ALGO,
+        "reason": reason,
+        "directories": directories,
+        "program_path": script_path,
+        "program_hash": program_hash,
+        "config_path": config.config_path,
+        "config_hash": config_hash,
+        "files": files,
+    }
+
+
+def validate_deployment_approval(state_data: Dict[str, Any]) -> None:
+    """Ensures active deployment has at least one approval."""
+    deploy = state_data.get("deploy", {})
+    if not deploy.get("active"):
+        return
+    started_at = str(deploy.get("started_at", ""))
+    approvals = state_data.get("approvals", [])
+    for approval in approvals:
+        if str(approval.get("time", "")) >= started_at:
+            return
+    raise NdriftError("Active deployment requires approval before baseline update")
+
+
+def run_init(args: argparse.Namespace) -> int:
+    """Handles baseline initialization command."""
+    config_path = normalize_path(args.config)
+    if not os.path.exists(config_path):
+        write_config_file(config_path, directories=args.directories)
+    elif args.directories:
+        update_config_directories(config_path, args.directories)
+
+    config = load_config(config_path)
+    logger = setup_logger(config)
+    directories = resolve_scan_dirs(config, args.directories)
+    assert_scan_directories(directories)
+
+    warnings = maybe_warn_baseline_location(config, directories)
+    for warning in warnings:
+        logger.warning(warning)
+
+    files, snapshot_warnings, errors, stats = snapshot_dirs(directories, config, previous_entries=None, logger=logger)
+    warnings.extend(snapshot_warnings)
+    if errors and not config.allow_read_errors:
+        raise NdriftError(f"Hashing failed for one or more files, count: {len(errors)}")
+
+    baseline_data = build_baseline_data(directories, config, files, reason="initial baseline")
+    write_baseline(config, baseline_data)
+    state_data = load_state(config)
+    add_audit_event(state_data, "init", {"directories": directories, "stats": stats})
+    save_state(config, state_data)
+
+    logger.info("Baseline created with %s files", len(files))
+    for warning in warnings:
+        print(f"[WARN] {warning}")
+    print(f"Baseline created: {config.baseline_path}")
+    print(f"Signature created: {config.signature_path}")
+    return EXIT_OK
+
+
+def build_integrity_findings(config: NdriftConfig, baseline_data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Builds findings and warnings for config and program integrity checks."""
+    findings: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+
+    expected_config_hash = str(baseline_data.get("config_hash", ""))
+    expected_program_hash = str(baseline_data.get("program_hash", ""))
+    current_config_hash = file_sha256(config.config_path)
+    current_program_hash = file_sha256(normalize_path(os.path.realpath(__file__)))
+
+    if expected_config_hash and expected_config_hash != current_config_hash:
+        findings.append(
+            {
+                "type": "MOD_CONFIG",
+                "path": config.config_path,
+                "detail": f"{expected_config_hash} -> {current_config_hash}",
+            }
+        )
+
+    if expected_program_hash and expected_program_hash != current_program_hash:
+        findings.append(
+            {
+                "type": "MOD_PROGRAM",
+                "path": normalize_path(os.path.realpath(__file__)),
+                "detail": f"{expected_program_hash} -> {current_program_hash}",
+            }
+        )
+
+    warnings.extend(check_program_security(normalize_path(os.path.realpath(__file__))))
+    return findings, warnings
+
+
+def run_scan_once(
+    config: NdriftConfig,
+    cli_dirs: Optional[List[str]],
+    json_output: bool,
+    logger: logging.Logger,
+) -> int:
+    """Executes a single scan and report cycle."""
+    directories = resolve_scan_dirs(config, cli_dirs)
+    assert_scan_directories(directories)
+    baseline_data = load_baseline(config)
+    baseline_entries = baseline_data.get("files", {})
+    if not isinstance(baseline_entries, dict):
+        raise NdriftError("Baseline files section is invalid")
+
+    warnings = maybe_warn_baseline_location(config, directories)
+    integrity_findings, integrity_warnings = build_integrity_findings(config, baseline_data)
+    warnings.extend(integrity_warnings)
+
+    current_entries, snapshot_warnings, errors, stats = snapshot_dirs(
+        directories,
+        config,
+        previous_entries=baseline_entries,
+        logger=logger,
+    )
+    warnings.extend(snapshot_warnings)
+
+    findings = integrity_findings + compare_snapshots(baseline_entries, current_entries)
+    if stats.get("size_limited", 0) > 0:
+        warnings.append(f"Files above max size limit: {stats.get('size_limited', 0)}")
+
+    report = {
+        "time": utc_now(),
+        "directories": directories,
+        "summary": summarize_findings(findings),
+        "findings": findings,
+        "warnings": warnings,
+        "errors": errors,
+        "stats": stats,
+    }
+
+    if config.scan_updates_baseline:
+        if errors and not config.allow_read_errors:
+            warnings.append(
+                "Baseline auto update skipped because strict read error policy is enabled"
+            )
+        else:
+            baseline_data = build_baseline_data(
+                directories,
+                config,
+                current_entries,
+                reason="auto baseline refresh from scan",
+            )
+            write_baseline(config, baseline_data)
+            logger.info("Baseline auto updated after scan")
+
+    write_report(config, report)
+    maybe_send_alerts(config, report, logger)
+
+    if json_output:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print_report_console(report)
+
+    if errors and not config.allow_read_errors:
+        return EXIT_ERROR
+    if findings:
+        return EXIT_CHANGES
+    return EXIT_OK
+
+
+def run_scan(args: argparse.Namespace) -> int:
+    """Handles scan command."""
+    config = load_config(args.config)
+    logger = setup_logger(config)
+    return run_scan_once(config, args.directories, args.json, logger)
+
+
+def run_watch(args: argparse.Namespace) -> int:
+    """Handles watch command loop with interval scanning."""
+    config = load_config(args.config)
+    logger = setup_logger(config)
+    interval = max(int(args.interval), 1)
+    stop_requested = {"value": False}
+
+    def mark_stop(_signum: int, _frame: Any) -> None:
+        stop_requested["value"] = True
+
+    signal.signal(signal.SIGINT, mark_stop)
+    signal.signal(signal.SIGTERM, mark_stop)
+
+    logger.info("Watch mode started with interval %s seconds", interval)
+    while not stop_requested["value"]:
+        exit_code = run_scan_once(config, args.directories, args.json, logger)
+        if exit_code == EXIT_ERROR:
+            logger.error("Watch scan returned error")
+        if stop_requested["value"]:
+            break
+        time.sleep(interval)
+
+    logger.info("Watch mode stopped")
+    return EXIT_OK
+
+
+def run_update_baseline(args: argparse.Namespace) -> int:
+    """Handles baseline update command with audit tracking."""
+    config = load_config(args.config)
+    logger = setup_logger(config)
+    directories = resolve_scan_dirs(config, args.directories)
+    assert_scan_directories(directories)
+
+    if args.require_signature:
+        verify_baseline_signature(config)
+
+    state_data = load_state(config)
+    validate_deployment_approval(state_data)
+
+    reason = args.reason.strip()
+    if not reason:
+        raise NdriftError("Baseline update requires a reason")
+
+    previous_entries: Optional[Dict[str, Dict[str, Any]]] = None
+    if os.path.exists(config.baseline_path):
+        try:
+            baseline_data = load_baseline(config)
+            candidate = baseline_data.get("files", {})
+            if isinstance(candidate, dict):
+                previous_entries = candidate
+        except Exception:
+            previous_entries = None
+
+    files, warnings, errors, stats = snapshot_dirs(directories, config, previous_entries, logger)
+    if warnings:
+        for warning in warnings:
+            logger.warning(warning)
+    if errors and not config.allow_read_errors:
+        raise NdriftError(f"Hashing failed for one or more files, count: {len(errors)}")
+
+    baseline_data = build_baseline_data(directories, config, files, reason=reason)
+    write_baseline(config, baseline_data)
+
+    add_audit_event(
+        state_data,
+        "update-baseline",
+        {
+            "reason": reason,
+            "directories": directories,
+            "stats": stats,
+        },
+    )
+    save_state(config, state_data)
+    logger.info("Baseline updated with %s files", len(files))
+    print(f"Baseline updated: {config.baseline_path}")
+    return EXIT_OK
+
+
+def run_report(args: argparse.Namespace) -> int:
+    """Prints the most recent report from disk."""
+    config = load_config(args.config)
+    if not os.path.exists(config.last_report_path):
+        raise NdriftError(f"No report found at: {config.last_report_path}")
+    with open(config.last_report_path, "r", encoding="utf-8") as handle:
+        report = json.load(handle)
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print_report_console(report)
+    return EXIT_OK
+
+
+def run_deploy_start(args: argparse.Namespace) -> int:
+    """Marks deployment window start in state file."""
+    config = load_config(args.config)
+    state_data = load_state(config)
+    deploy = state_data.setdefault("deploy", {})
+    if deploy.get("active"):
+        raise NdriftError("Deployment mode is already active")
+    deploy["active"] = True
+    deploy["started_at"] = utc_now()
+    deploy["started_by"] = getpass.getuser()
+    add_audit_event(state_data, "deploy-start", {"started_at": deploy["started_at"]})
+    save_state(config, state_data)
+    print("Deployment mode started")
+    return EXIT_OK
+
+
+def run_approve(args: argparse.Namespace) -> int:
+    """Stores deployment approval with reason for audit."""
+    config = load_config(args.config)
+    state_data = load_state(config)
+    reason = args.reason.strip()
+    if not reason:
+        raise NdriftError("Approval reason is required")
+    approval = {
+        "time": utc_now(),
+        "user": getpass.getuser(),
+        "reason": reason,
+        "deploy_active": bool(state_data.get("deploy", {}).get("active")),
+    }
+    state_data.setdefault("approvals", []).append(approval)
+    add_audit_event(state_data, "approve", approval)
+    save_state(config, state_data)
+    print("Approval recorded")
+    return EXIT_OK
+
+
+def run_deploy_end(args: argparse.Namespace) -> int:
+    """Marks deployment window end in state file."""
+    config = load_config(args.config)
+    state_data = load_state(config)
+    deploy = state_data.setdefault("deploy", {})
+    if not deploy.get("active"):
+        raise NdriftError("Deployment mode is not active")
+    ended_at = utc_now()
+    deploy["active"] = False
+    deploy["ended_at"] = ended_at
+    add_audit_event(state_data, "deploy-end", {"ended_at": ended_at})
+    save_state(config, state_data)
+    print("Deployment mode ended")
+    return EXIT_OK
+
+
+def run_cron(args: argparse.Namespace) -> int:
+    """Prints suggested cron entry from config schedule."""
+    config = load_config(args.config)
+    script_path = normalize_path(os.path.realpath(__file__))
+    line = f"{config.cron_schedule} {script_path} scan --config {config.config_path}"
+    print(line)
+    return EXIT_OK
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Creates command line parser for ndrift."""
+    parser = argparse.ArgumentParser(
+        prog="ndrift",
+        description="Lightweight file integrity monitor for Linux",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    init_cmd = sub.add_parser("init", help="create baseline")
+    init_cmd.add_argument("directories", nargs="+", help="directories to monitor")
+    init_cmd.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="config file path")
+
+    scan_cmd = sub.add_parser("scan", help="scan for changes")
+    scan_cmd.add_argument("directories", nargs="*", help="override configured directories")
+    scan_cmd.add_argument("--json", action="store_true", help="emit JSON output")
+    scan_cmd.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="config file path")
+
+    watch_cmd = sub.add_parser("watch", help="continuous periodic scan")
+    watch_cmd.add_argument("directories", nargs="*", help="override configured directories")
+    watch_cmd.add_argument("--interval", type=int, default=60, help="seconds between scans")
+    watch_cmd.add_argument("--json", action="store_true", help="emit JSON output")
+    watch_cmd.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="config file path")
+
+    update_cmd = sub.add_parser("update-baseline", help="rebuild baseline")
+    update_cmd.add_argument("directories", nargs="*", help="override configured directories")
+    update_cmd.add_argument("--reason", required=True, help="audit reason for update")
+    update_cmd.add_argument("--require-signature", action="store_true", help="verify current baseline signature first")
+    update_cmd.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="config file path")
+
+    report_cmd = sub.add_parser("report", help="print last report")
+    report_cmd.add_argument("--json", action="store_true", help="emit JSON output")
+    report_cmd.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="config file path")
+
+    deploy_start_cmd = sub.add_parser("deploy-start", help="start deployment window")
+    deploy_start_cmd.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="config file path")
+
+    approve_cmd = sub.add_parser("approve", help="approve deployment change")
+    approve_cmd.add_argument("--reason", required=True, help="approval reason")
+    approve_cmd.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="config file path")
+
+    deploy_end_cmd = sub.add_parser("deploy-end", help="end deployment window")
+    deploy_end_cmd.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="config file path")
+
+    cron_cmd = sub.add_parser("cron", help="print suggested cron entry")
+    cron_cmd.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="config file path")
+
+    return parser
+
+
+def dispatch(args: argparse.Namespace) -> int:
+    """Dispatches parsed arguments to command handlers."""
+    if args.command == "init":
+        return run_init(args)
+    if args.command == "scan":
+        return run_scan(args)
+    if args.command == "watch":
+        return run_watch(args)
+    if args.command == "update-baseline":
+        return run_update_baseline(args)
+    if args.command == "report":
+        return run_report(args)
+    if args.command == "deploy-start":
+        return run_deploy_start(args)
+    if args.command == "approve":
+        return run_approve(args)
+    if args.command == "deploy-end":
+        return run_deploy_end(args)
+    if args.command == "cron":
+        return run_cron(args)
+    raise NdriftError(f"Unsupported command: {args.command}")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Main entry point for CLI execution."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return dispatch(args)
+    except NdriftError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    except KeyboardInterrupt:
+        print("Interrupted", file=sys.stderr)
+        return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    sys.exit(main())
