@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Brad Boegler <bradthx@gmail.com>
+# Licensed under the MIT License. See LICENSE.
 import configparser
 import importlib.util
 import json

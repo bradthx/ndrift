@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Brad Boegler <bradthx@gmail.com>
+# Licensed under the MIT License. See LICENSE.
 """ndrift is a lightweight file integrity monitor for Linux."""
 
 import argparse

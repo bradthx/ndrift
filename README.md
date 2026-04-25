@@ -1,5 +1,9 @@
 # ndrift
 
+Copyright (c) 2026 Brad Boegler <bradthx@gmail.com>
+
+Licensed under the MIT License. See [LICENSE](LICENSE).
+
 ndrift is a lightweight Linux file integrity monitor.
 
 It builds a trusted baseline of file metadata and content hashes, then compares future scans to detect drift such as modified files, added files, deleted files, permission changes, ownership changes, timestamp only changes, and filesystem attribute changes.
