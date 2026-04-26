@@ -136,7 +136,7 @@ If scan_updates_baseline is true, ndrift updates baseline after each scan.
 
 ~~~bash
 chmod +x ./ndrift
-./ndrift init /path/to/monitor --config ./ndrift-config.conf
+./ndrift init /path/to/monitor --config ./ndrift.conf
 ~~~
 
 ### Optional system wide install
@@ -146,7 +146,7 @@ sudo install -o root -g root -m 0755 ./ndrift /usr/local/bin/ndrift
 sudo install -d -o root -g root -m 0700 /var/lib/ndrift
 sudo install -d -o root -g root -m 0750 /var/log/ndrift
 sudo install -d -o root -g root -m 0755 /etc/ndrift
-sudo install -o root -g root -m 0600 ./ndrift-config.conf /etc/ndrift/ndrift.conf
+sudo install -o root -g root -m 0600 ./ndrift.conf /etc/ndrift/ndrift.conf
 ~~~
 
 ### Default runtime paths on single tenant hosts
@@ -223,7 +223,7 @@ If you change cron_schedule in config, run the cron command again and replace th
 
 System default config path: /etc/ndrift/ndrift.conf.
 
-Template in this repository: [ndrift-config.conf](ndrift-config.conf).
+Template in this repository: [ndrift.conf](ndrift.conf).
 
 ### Core path settings
 
@@ -351,4 +351,4 @@ integrations. Only enable if you understand this and have a very specific use ca
 ## Project files
 
 1. [ndrift](ndrift): executable CLI program
-2. [ndrift-config.conf](ndrift-config.conf): default configuration template
+2. [ndrift.conf](ndrift.conf): default configuration template
