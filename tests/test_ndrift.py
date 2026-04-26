@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Brad Boegler <bradthx@gmail.com>
 # Licensed under the MIT License. See LICENSE.
 import configparser
+import fcntl
 import importlib.util
 import json
 import os
@@ -50,6 +51,8 @@ def build_config_file(config_path: Path, site_dir: Path, overrides=None):
         "signature_path": str(state_dir / "ndrift-baseline.json.sig"),
         "signature_key_path": str(state_dir / "ndrift-baseline.key"),
         "state_path": str(state_dir / "ndrift-state.json"),
+        "state_signature_path": str(state_dir / "ndrift-state.json.sig"),
+        "lock_path": str(state_dir / "ndrift.lock"),
         "last_report_path": str(state_dir / "ndrift-report.json"),
         "log_path": str(log_dir / "ndrift.log"),
         "log_max_bytes": "1048576",
@@ -58,7 +61,7 @@ def build_config_file(config_path: Path, site_dir: Path, overrides=None):
         "max_file_size_mb": "50",
         "hash_on_metadata_change_only": "true",
         "throttle_ms": "0",
-        "cron_schedule": "*/5 * * * *",
+        "cron_schedule": "*/30 * * * *",
         "email_to": "",
         "smtp_host": "localhost",
         "slack_webhook": "",
@@ -144,8 +147,58 @@ class NdriftIntegrationTests(unittest.TestCase):
             "signature_path",
             "signature_key_path",
             "state_path",
+            "state_signature_path",
+            "lock_path",
         ]:
             self.assertTrue(Path(self.config_values[key]).exists(), msg=f"missing {key}")
+
+    def test_scan_fails_when_lock_is_held(self):
+        self._write("index.php", "<?php echo 1;\n")
+        self._init_baseline()
+
+        lock_path = Path(self.config_values["lock_path"])
+        with open(lock_path, "w", encoding="utf-8") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            blocked = run_ndrift(["scan", str(self.site_dir)], self.config_path)
+
+        self.assertEqual(blocked.returncode, 2)
+        self.assertIn("already running", blocked.stderr)
+
+    def test_default_cron_schedule_is_30_minutes(self):
+        cron = run_ndrift(["cron"], self.config_path)
+        self.assertEqual(cron.returncode, 0)
+        self.assertTrue(cron.stdout.strip().startswith("*/30 * * * *"))
+
+    def test_state_signature_tamper_blocks_state_trust(self):
+        self._write("index.php", "<?php echo 1;\n")
+        self._init_baseline()
+
+        state_path = Path(self.config_values["state_path"])
+        state_data = json.loads(state_path.read_text(encoding="utf-8"))
+        state_data.setdefault("approvals", []).append(
+            {
+                "time": "2099-01-01T00:00:00+00:00",
+                "user": "attacker",
+                "reason": "forged",
+                "deploy_active": True,
+            }
+        )
+        state_path.write_text(json.dumps(state_data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        deploy_start = run_ndrift(["deploy-start"], self.config_path)
+        self.assertEqual(deploy_start.returncode, 2)
+        self.assertIn("Cannot verify state signature", deploy_start.stderr)
+
+    def test_state_signature_missing_is_error(self):
+        self._write("index.php", "<?php echo 1;\n")
+        self._init_baseline()
+
+        state_sig_path = Path(self.config_values["state_signature_path"])
+        state_sig_path.unlink()
+
+        approve = run_ndrift(["approve", "--reason", "missing sig"], self.config_path)
+        self.assertEqual(approve.returncode, 2)
+        self.assertIn("Cannot verify state signature", approve.stderr)
 
     def test_scan_detects_added_modified_deleted_and_permission_changes(self):
         index_file = self._write("index.php", "<?php echo 1;\n")
