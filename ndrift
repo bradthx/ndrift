@@ -6,6 +6,7 @@
 import argparse
 import configparser
 import datetime as dt
+import fcntl
 import fnmatch
 import getpass
 import grp
@@ -25,6 +26,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -55,6 +57,8 @@ class NdriftConfig:
     signature_path: str
     signature_key_path: str
     state_path: str
+    state_signature_path: str
+    lock_path: str
     last_report_path: str
     log_path: str
     log_max_bytes: int
@@ -180,6 +184,8 @@ def default_config_values(config_path: str) -> Dict[str, str]:
         "signature_path": "/var/lib/ndrift/ndrift-baseline.json.sig",
         "signature_key_path": "/var/lib/ndrift/ndrift-baseline.key",
         "state_path": "/var/lib/ndrift/ndrift-state.json",
+        "state_signature_path": "/var/lib/ndrift/ndrift-state.json.sig",
+        "lock_path": "/var/lib/ndrift/ndrift.lock",
         "last_report_path": "/var/lib/ndrift/ndrift-report.json",
         "log_path": "/var/log/ndrift/ndrift.log",
         "log_max_bytes": "1048576",
@@ -188,7 +194,7 @@ def default_config_values(config_path: str) -> Dict[str, str]:
         "max_file_size_mb": "50",
         "hash_on_metadata_change_only": "true",
         "throttle_ms": "0",
-        "cron_schedule": "*/5 * * * *",
+        "cron_schedule": "*/30 * * * *",
         "email_to": "",
         "smtp_host": "localhost",
         "slack_webhook": "",
@@ -244,6 +250,8 @@ def load_config(config_path: str) -> NdriftConfig:
     signature_path = resolve_config_relative_path(config_path, get_value("signature_path"))
     signature_key_path = resolve_config_relative_path(config_path, get_value("signature_key_path"))
     state_path = resolve_config_relative_path(config_path, get_value("state_path"))
+    state_signature_path = resolve_config_relative_path(config_path, get_value("state_signature_path"))
+    lock_path = resolve_config_relative_path(config_path, get_value("lock_path"))
     last_report_path = resolve_config_relative_path(config_path, get_value("last_report_path"))
     log_path = resolve_config_relative_path(config_path, get_value("log_path"))
 
@@ -256,6 +264,8 @@ def load_config(config_path: str) -> NdriftConfig:
         signature_path=signature_path,
         signature_key_path=signature_key_path,
         state_path=state_path,
+        state_signature_path=state_signature_path,
+        lock_path=lock_path,
         last_report_path=last_report_path,
         log_path=log_path,
         log_max_bytes=int(get_value("log_max_bytes")),
@@ -579,6 +589,11 @@ def baseline_to_bytes(baseline_data: Dict[str, Any]) -> bytes:
     return json.dumps(baseline_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def state_to_bytes(state_data: Dict[str, Any]) -> bytes:
+    """Serializes state data in stable JSON form."""
+    return json.dumps(state_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
 def write_baseline(config: NdriftConfig, baseline_data: Dict[str, Any]) -> None:
     """Writes baseline file and detached signature file."""
     key = load_or_create_key(config.signature_key_path)
@@ -625,31 +640,124 @@ def default_state() -> Dict[str, Any]:
         "deploy": {"active": False, "started_at": "", "started_by": ""},
         "approvals": [],
         "audit": [],
+        "meta": {"revision": 0, "previous_hash": ""},
     }
 
 
-def load_state(config: NdriftConfig) -> Dict[str, Any]:
-    """Loads state JSON or creates defaults."""
-    if not os.path.exists(config.state_path):
-        return default_state()
-    with open(config.state_path, "r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    if not isinstance(data, dict):
-        raise NdriftError("State file is invalid")
+def normalize_state_data(state_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalizes state data and enforces expected field types."""
     merged = default_state()
-    merged.update(data)
+    merged.update(state_data)
     if not isinstance(merged.get("deploy"), dict):
         merged["deploy"] = default_state()["deploy"]
     if not isinstance(merged.get("approvals"), list):
         merged["approvals"] = []
     if not isinstance(merged.get("audit"), list):
         merged["audit"] = []
+    if not isinstance(merged.get("meta"), dict):
+        merged["meta"] = default_state()["meta"]
+
+    meta = merged["meta"]
+    revision_value = meta.get("revision", 0)
+    try:
+        revision = int(revision_value)
+    except (TypeError, ValueError):
+        revision = 0
+    meta["revision"] = max(revision, 0)
+    prev_hash = meta.get("previous_hash", "")
+    meta["previous_hash"] = str(prev_hash)
     return merged
+
+
+@contextmanager
+def process_lock(config: NdriftConfig):
+    """Acquires an advisory lock to prevent overlapping ndrift processes."""
+    ensure_parent_dir(config.lock_path)
+    lock_fd = os.open(config.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.fchmod(lock_fd, 0o600)
+    except OSError:
+        pass
+
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(lock_fd)
+        raise NdriftError(
+            f"Another ndrift process is already running, lock: {config.lock_path}"
+        ) from exc
+
+    try:
+        os.lseek(lock_fd, 0, os.SEEK_SET)
+        os.ftruncate(lock_fd, 0)
+        os.write(lock_fd, f"pid={os.getpid()}\n".encode("utf-8"))
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+def load_state_signed_payload(config: NdriftConfig) -> Dict[str, Any]:
+    """Loads state payload and verifies detached signature."""
+    if not os.path.exists(config.state_path):
+        raise NdriftError(f"Cannot read state file: {config.state_path}")
+    if not os.path.exists(config.state_signature_path):
+        raise NdriftError(
+            f"Cannot verify state signature, file is missing: {config.state_signature_path}"
+        )
+
+    with open(config.state_path, "r", encoding="utf-8") as handle:
+        payload_data = json.load(handle)
+    if not isinstance(payload_data, dict):
+        raise NdriftError("State file is invalid")
+
+    with open(config.state_signature_path, "r", encoding="utf-8") as sig_handle:
+        state_signature = sig_handle.read().strip()
+    if not state_signature:
+        raise NdriftError("Cannot verify state signature, signature file is empty")
+
+    key = load_or_create_key(config.signature_key_path)
+    payload_bytes = state_to_bytes(payload_data)
+    if not verify_payload_signature(payload_bytes, key, state_signature):
+        raise NdriftError("Cannot verify state signature, state integrity failed")
+    return payload_data
+
+
+def load_state(config: NdriftConfig) -> Dict[str, Any]:
+    """Loads state JSON or creates defaults."""
+    if not os.path.exists(config.state_path):
+        return default_state()
+    data = load_state_signed_payload(config)
+    return normalize_state_data(data)
 
 
 def save_state(config: NdriftConfig, state_data: Dict[str, Any]) -> None:
     """Writes deployment state JSON to disk."""
-    atomic_write_text(config.state_path, json.dumps(state_data, indent=2, sort_keys=True) + "\n", mode=0o600)
+    previous_state: Optional[Dict[str, Any]] = None
+    if os.path.exists(config.state_path):
+        previous_state = normalize_state_data(load_state_signed_payload(config))
+
+    normalized = normalize_state_data(state_data)
+    previous_hash = ""
+    previous_revision = 0
+    if previous_state is not None:
+        previous_hash = data_sha256(state_to_bytes(previous_state))
+        previous_revision = int(previous_state.get("meta", {}).get("revision", 0))
+
+    normalized["meta"]["previous_hash"] = previous_hash
+    normalized["meta"]["revision"] = previous_revision + 1
+
+    key = load_or_create_key(config.signature_key_path)
+    signature = sign_payload(state_to_bytes(normalized), key)
+
+    atomic_write_text(
+        config.state_path,
+        json.dumps(normalized, indent=2, sort_keys=True) + "\n",
+        mode=0o600,
+    )
+    atomic_write_text(config.state_signature_path, signature + "\n", mode=0o600)
 
 
 def add_audit_event(state_data: Dict[str, Any], event: str, details: Dict[str, Any]) -> None:
@@ -860,29 +968,30 @@ def run_init(args: argparse.Namespace) -> int:
 
     config = load_config(config_path)
     logger = setup_logger(config)
-    directories = resolve_scan_dirs(config, args.directories)
-    assert_scan_directories(directories)
+    with process_lock(config):
+        directories = resolve_scan_dirs(config, args.directories)
+        assert_scan_directories(directories)
 
-    warnings = maybe_warn_baseline_location(config, directories)
-    for warning in warnings:
-        logger.warning(warning)
+        warnings = maybe_warn_baseline_location(config, directories)
+        for warning in warnings:
+            logger.warning(warning)
 
-    files, snapshot_warnings, errors, stats = snapshot_dirs(directories, config, previous_entries=None, logger=logger)
-    warnings.extend(snapshot_warnings)
-    if errors and not config.allow_read_errors:
-        raise NdriftError(f"Hashing failed for one or more files, count: {len(errors)}")
+        files, snapshot_warnings, errors, stats = snapshot_dirs(directories, config, previous_entries=None, logger=logger)
+        warnings.extend(snapshot_warnings)
+        if errors and not config.allow_read_errors:
+            raise NdriftError(f"Hashing failed for one or more files, count: {len(errors)}")
 
-    baseline_data = build_baseline_data(directories, config, files, reason="initial baseline")
-    write_baseline(config, baseline_data)
-    state_data = load_state(config)
-    add_audit_event(state_data, "init", {"directories": directories, "stats": stats})
-    save_state(config, state_data)
+        baseline_data = build_baseline_data(directories, config, files, reason="initial baseline")
+        write_baseline(config, baseline_data)
+        state_data = load_state(config)
+        add_audit_event(state_data, "init", {"directories": directories, "stats": stats})
+        save_state(config, state_data)
 
-    logger.info("Baseline created with %s files", len(files))
-    for warning in warnings:
-        print(f"[WARN] {warning}")
-    print(f"Baseline created: {config.baseline_path}")
-    print(f"Signature created: {config.signature_path}")
+        logger.info("Baseline created with %s files", len(files))
+        for warning in warnings:
+            print(f"[WARN] {warning}")
+        print(f"Baseline created: {config.baseline_path}")
+        print(f"Signature created: {config.signature_path}")
     return EXIT_OK
 
 
@@ -925,66 +1034,67 @@ def run_scan_once(
     logger: logging.Logger,
 ) -> int:
     """Executes a single scan and report cycle."""
-    directories = resolve_scan_dirs(config, cli_dirs)
-    assert_scan_directories(directories)
-    baseline_data = load_baseline(config)
-    baseline_entries = baseline_data.get("files", {})
-    if not isinstance(baseline_entries, dict):
-        raise NdriftError("Baseline files section is invalid")
+    with process_lock(config):
+        directories = resolve_scan_dirs(config, cli_dirs)
+        assert_scan_directories(directories)
+        baseline_data = load_baseline(config)
+        baseline_entries = baseline_data.get("files", {})
+        if not isinstance(baseline_entries, dict):
+            raise NdriftError("Baseline files section is invalid")
 
-    warnings = maybe_warn_baseline_location(config, directories)
-    integrity_findings, integrity_warnings = build_integrity_findings(config, baseline_data)
-    warnings.extend(integrity_warnings)
+        warnings = maybe_warn_baseline_location(config, directories)
+        integrity_findings, integrity_warnings = build_integrity_findings(config, baseline_data)
+        warnings.extend(integrity_warnings)
 
-    current_entries, snapshot_warnings, errors, stats = snapshot_dirs(
-        directories,
-        config,
-        previous_entries=baseline_entries,
-        logger=logger,
-    )
-    warnings.extend(snapshot_warnings)
+        current_entries, snapshot_warnings, errors, stats = snapshot_dirs(
+            directories,
+            config,
+            previous_entries=baseline_entries,
+            logger=logger,
+        )
+        warnings.extend(snapshot_warnings)
 
-    findings = integrity_findings + compare_snapshots(baseline_entries, current_entries)
-    if stats.get("size_limited", 0) > 0:
-        warnings.append(f"Files above max size limit: {stats.get('size_limited', 0)}")
+        findings = integrity_findings + compare_snapshots(baseline_entries, current_entries)
+        if stats.get("size_limited", 0) > 0:
+            warnings.append(f"Files above max size limit: {stats.get('size_limited', 0)}")
 
-    report = {
-        "time": utc_now(),
-        "directories": directories,
-        "summary": summarize_findings(findings),
-        "findings": findings,
-        "warnings": warnings,
-        "errors": errors,
-        "stats": stats,
-    }
+        report = {
+            "time": utc_now(),
+            "directories": directories,
+            "summary": summarize_findings(findings),
+            "findings": findings,
+            "warnings": warnings,
+            "errors": errors,
+            "stats": stats,
+        }
 
-    if config.scan_updates_baseline:
-        if errors and not config.allow_read_errors:
-            warnings.append(
-                "Baseline auto update skipped because strict read error policy is enabled"
-            )
+        if config.scan_updates_baseline:
+            if errors and not config.allow_read_errors:
+                warnings.append(
+                    "Baseline auto update skipped because strict read error policy is enabled"
+                )
+            else:
+                baseline_data = build_baseline_data(
+                    directories,
+                    config,
+                    current_entries,
+                    reason="auto baseline refresh from scan",
+                )
+                write_baseline(config, baseline_data)
+                logger.info("Baseline auto updated after scan")
+
+        write_report(config, report)
+        maybe_send_alerts(config, report, logger)
+
+        if json_output:
+            print(json.dumps(report, indent=2, sort_keys=True))
         else:
-            baseline_data = build_baseline_data(
-                directories,
-                config,
-                current_entries,
-                reason="auto baseline refresh from scan",
-            )
-            write_baseline(config, baseline_data)
-            logger.info("Baseline auto updated after scan")
+            print_report_console(report)
 
-    write_report(config, report)
-    maybe_send_alerts(config, report, logger)
-
-    if json_output:
-        print(json.dumps(report, indent=2, sort_keys=True))
-    else:
-        print_report_console(report)
-
-    if errors and not config.allow_read_errors:
-        return EXIT_ERROR
-    if findings:
-        return EXIT_CHANGES
+        if errors and not config.allow_read_errors:
+            return EXIT_ERROR
+        if findings:
+            return EXIT_CHANGES
     return EXIT_OK
 
 
@@ -1025,51 +1135,52 @@ def run_update_baseline(args: argparse.Namespace) -> int:
     """Handles baseline update command with audit tracking."""
     config = load_config(args.config)
     logger = setup_logger(config)
-    directories = resolve_scan_dirs(config, args.directories)
-    assert_scan_directories(directories)
+    with process_lock(config):
+        directories = resolve_scan_dirs(config, args.directories)
+        assert_scan_directories(directories)
 
-    if args.require_signature:
-        verify_baseline_signature(config)
+        if args.require_signature:
+            verify_baseline_signature(config)
 
-    state_data = load_state(config)
-    validate_deployment_approval(state_data)
+        state_data = load_state(config)
+        validate_deployment_approval(state_data)
 
-    reason = args.reason.strip()
-    if not reason:
-        raise NdriftError("Baseline update requires a reason")
+        reason = args.reason.strip()
+        if not reason:
+            raise NdriftError("Baseline update requires a reason")
 
-    previous_entries: Optional[Dict[str, Dict[str, Any]]] = None
-    if os.path.exists(config.baseline_path):
-        try:
-            baseline_data = load_baseline(config)
-            candidate = baseline_data.get("files", {})
-            if isinstance(candidate, dict):
-                previous_entries = candidate
-        except Exception:
-            previous_entries = None
+        previous_entries: Optional[Dict[str, Dict[str, Any]]] = None
+        if os.path.exists(config.baseline_path):
+            try:
+                baseline_data = load_baseline(config)
+                candidate = baseline_data.get("files", {})
+                if isinstance(candidate, dict):
+                    previous_entries = candidate
+            except Exception:
+                previous_entries = None
 
-    files, warnings, errors, stats = snapshot_dirs(directories, config, previous_entries, logger)
-    if warnings:
-        for warning in warnings:
-            logger.warning(warning)
-    if errors and not config.allow_read_errors:
-        raise NdriftError(f"Hashing failed for one or more files, count: {len(errors)}")
+        files, warnings, errors, stats = snapshot_dirs(directories, config, previous_entries, logger)
+        if warnings:
+            for warning in warnings:
+                logger.warning(warning)
+        if errors and not config.allow_read_errors:
+            raise NdriftError(f"Hashing failed for one or more files, count: {len(errors)}")
 
-    baseline_data = build_baseline_data(directories, config, files, reason=reason)
-    write_baseline(config, baseline_data)
+        baseline_data = build_baseline_data(directories, config, files, reason=reason)
+        write_baseline(config, baseline_data)
 
-    add_audit_event(
-        state_data,
-        "update-baseline",
-        {
-            "reason": reason,
-            "directories": directories,
-            "stats": stats,
-        },
-    )
-    save_state(config, state_data)
-    logger.info("Baseline updated with %s files", len(files))
-    print(f"Baseline updated: {config.baseline_path}")
+        add_audit_event(
+            state_data,
+            "update-baseline",
+            {
+                "reason": reason,
+                "directories": directories,
+                "stats": stats,
+            },
+        )
+        save_state(config, state_data)
+        logger.info("Baseline updated with %s files", len(files))
+        print(f"Baseline updated: {config.baseline_path}")
     return EXIT_OK
 
 
@@ -1090,15 +1201,16 @@ def run_report(args: argparse.Namespace) -> int:
 def run_deploy_start(args: argparse.Namespace) -> int:
     """Marks deployment window start in state file."""
     config = load_config(args.config)
-    state_data = load_state(config)
-    deploy = state_data.setdefault("deploy", {})
-    if deploy.get("active"):
-        raise NdriftError("Deployment mode is already active")
-    deploy["active"] = True
-    deploy["started_at"] = utc_now()
-    deploy["started_by"] = getpass.getuser()
-    add_audit_event(state_data, "deploy-start", {"started_at": deploy["started_at"]})
-    save_state(config, state_data)
+    with process_lock(config):
+        state_data = load_state(config)
+        deploy = state_data.setdefault("deploy", {})
+        if deploy.get("active"):
+            raise NdriftError("Deployment mode is already active")
+        deploy["active"] = True
+        deploy["started_at"] = utc_now()
+        deploy["started_by"] = getpass.getuser()
+        add_audit_event(state_data, "deploy-start", {"started_at": deploy["started_at"]})
+        save_state(config, state_data)
     print("Deployment mode started")
     return EXIT_OK
 
@@ -1106,19 +1218,20 @@ def run_deploy_start(args: argparse.Namespace) -> int:
 def run_approve(args: argparse.Namespace) -> int:
     """Stores deployment approval with reason for audit."""
     config = load_config(args.config)
-    state_data = load_state(config)
-    reason = args.reason.strip()
-    if not reason:
-        raise NdriftError("Approval reason is required")
-    approval = {
-        "time": utc_now(),
-        "user": getpass.getuser(),
-        "reason": reason,
-        "deploy_active": bool(state_data.get("deploy", {}).get("active")),
-    }
-    state_data.setdefault("approvals", []).append(approval)
-    add_audit_event(state_data, "approve", approval)
-    save_state(config, state_data)
+    with process_lock(config):
+        state_data = load_state(config)
+        reason = args.reason.strip()
+        if not reason:
+            raise NdriftError("Approval reason is required")
+        approval = {
+            "time": utc_now(),
+            "user": getpass.getuser(),
+            "reason": reason,
+            "deploy_active": bool(state_data.get("deploy", {}).get("active")),
+        }
+        state_data.setdefault("approvals", []).append(approval)
+        add_audit_event(state_data, "approve", approval)
+        save_state(config, state_data)
     print("Approval recorded")
     return EXIT_OK
 
@@ -1126,15 +1239,16 @@ def run_approve(args: argparse.Namespace) -> int:
 def run_deploy_end(args: argparse.Namespace) -> int:
     """Marks deployment window end in state file."""
     config = load_config(args.config)
-    state_data = load_state(config)
-    deploy = state_data.setdefault("deploy", {})
-    if not deploy.get("active"):
-        raise NdriftError("Deployment mode is not active")
-    ended_at = utc_now()
-    deploy["active"] = False
-    deploy["ended_at"] = ended_at
-    add_audit_event(state_data, "deploy-end", {"ended_at": ended_at})
-    save_state(config, state_data)
+    with process_lock(config):
+        state_data = load_state(config)
+        deploy = state_data.setdefault("deploy", {})
+        if not deploy.get("active"):
+            raise NdriftError("Deployment mode is not active")
+        ended_at = utc_now()
+        deploy["active"] = False
+        deploy["ended_at"] = ended_at
+        add_audit_event(state_data, "deploy-end", {"ended_at": ended_at})
+        save_state(config, state_data)
     print("Deployment mode ended")
     return EXIT_OK
 

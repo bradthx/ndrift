@@ -1,19 +1,35 @@
 # ndrift
 
+[![Tests](https://img.shields.io/github/actions/workflow/status/bradthx/ndrift/ci.yml?branch=main&label=tests)](https://github.com/bradthx/ndrift/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/bradthx/ndrift?label=release)](https://github.com/bradthx/ndrift/releases)
+
 Copyright (c) 2026 Brad Boegler <bradthx@gmail.com>
 
 Licensed under the MIT License. See [LICENSE](LICENSE).
 
 ndrift is a lightweight Linux file integrity monitor.
 
-It builds a trusted baseline of file metadata and content hashes, then compares future scans to detect drift such as modified files, added files, deleted files, permission changes, ownership changes, timestamp only changes, and filesystem attribute changes.
+File Integrity Monitoring is a crucial part of any application deployment. If your app files
+are changing, and you are not aware of it, that's a huge problem. I have seen hundreds of 
+examples of sites being compromized for various reasons, and site owners not being aware
+of it for weeks or even months while in the meantime, client data and pii is being stolen.
+
+FIM is part of just about every modern CNAPP solution, and usually readily available for
+applications deployed on the cloud. For many sites that are hosted on more traditional
+hosting deployments such as shared, Dedicated, or VPS environments, FIM is not always easy
+or implied to already exist by the hosting provider.
+
+I developed ndrift to be a super simple, but effective FIM utility that can be easily
+deployed to any linux hosted web application and provide a robust FIM solution.
+
+ndrift builds a trusted baseline of file metadata and content hashes, then compares future scans to detect drift such as modified files, added files, deleted files, permission changes, ownership changes, timestamp only changes, and filesystem attribute changes.
 
 ## What ndrift does
 
 1. Recursively scans one or more monitored directories.
 2. Applies include rules and exclude rules to control scan scope.
 3. Stores a signed baseline in local JSON files.
-4. Detects drift on each scan with both console output and JSON output.
+4. Detects file drift on each scan with both console output and JSON output.
 5. Writes logs with rotation.
 6. Supports periodic scan mode with an interval loop.
 7. Supports deployment approval workflow for safe baseline updates.
@@ -32,7 +48,7 @@ On init or baseline update, ndrift records per file data:
 5. mode bits
 6. uid and gid
 7. owner and group names
-8. lsattr flags when available
+8. lsattr flags
 
 The baseline file includes additional integrity data:
 
@@ -52,6 +68,16 @@ ndrift signs the canonical baseline JSON payload with HMAC SHA256 and writes a d
 3. Secret signing key path default: /var/lib/ndrift/ndrift-baseline.key
 
 On scan, signature verification runs before drift detection. If verification fails, ndrift returns exit code 2.
+
+### 2a. State signing and verification
+
+ndrift also signs deployment state and audit data with a detached HMAC signature.
+
+1. State file path default: /var/lib/ndrift/ndrift-state.json
+2. State signature path default: /var/lib/ndrift/ndrift-state.json.sig
+3. Signature key path default: /var/lib/ndrift/ndrift-baseline.key
+
+State signature verification runs before approval and deployment trust decisions. If verification fails, ndrift returns exit code 2.
 
 ### 3. Scan process
 
@@ -130,8 +156,10 @@ sudo install -o root -g root -m 0600 ./ndrift-config.conf /etc/ndrift/ndrift.con
 4. signature: /var/lib/ndrift/ndrift-baseline.json.sig
 5. signing key: /var/lib/ndrift/ndrift-baseline.key
 6. state: /var/lib/ndrift/ndrift-state.json
-7. last report: /var/lib/ndrift/ndrift-report.json
-8. log: /var/log/ndrift/ndrift.log
+7. state signature: /var/lib/ndrift/ndrift-state.json.sig
+8. lock file: /var/lib/ndrift/ndrift.lock
+9. last report: /var/lib/ndrift/ndrift-report.json
+10. log: /var/log/ndrift/ndrift.log
 
 ## Quick start
 
@@ -190,8 +218,10 @@ Template in this repository: [ndrift-config.conf](ndrift-config.conf).
 3. signature_path: detached signature path
 4. signature_key_path: HMAC key path
 5. state_path: deployment and audit state path
-6. last_report_path: latest scan report path
-7. log_path: rotating log file path
+6. state_signature_path: detached signature path for state integrity
+7. lock_path: process lock file path for overlap protection
+8. last_report_path: latest scan report path
+9. log_path: rotating log file path
 
 ### Scan scope and behavior settings
 
@@ -210,6 +240,8 @@ Template in this repository: [ndrift-config.conf](ndrift-config.conf).
 4. slack_webhook: webhook URL
 5. s3_bucket: object storage destination for report upload
 
+Default cron schedule is */30 * * * * which runs every 30 minutes.
+
 ### Error policy
 
 1. allow_read_errors false: treat file read failures as exit code 2
@@ -224,7 +256,7 @@ Template in this repository: [ndrift-config.conf](ndrift-config.conf).
 
 1. 0: scan completed with no findings
 2. 1: scan completed and findings were detected
-3. 2: runtime error, integrity verification failure, or strict read error condition
+3. 2: runtime error, integrity verification failure for baseline or state, or strict read error condition
 
 ## Report format
 
@@ -274,14 +306,15 @@ Then place the output into the desired cron context.
 ### Built in safeguards
 
 1. baseline signature verification before scan comparison
-2. baseline write operations use atomic replace
-3. baseline, signature, and key files are written with mode 600
-4. baseline location warning if placed inside monitored roots
-5. symlink following disabled by default
-6. configuration file hash drift detection
-7. program hash drift detection
-8. install posture warnings if program is not root owned or writable by group or others
-9. strict exit codes for automation and alert pipelines
+2. state signature verification before deployment approval checks and state load
+3. advisory lock file guard prevents overlapping runs from racing state and baseline updates
+4. baseline and state write operations use atomic replace
+5. baseline, state, signature, and key files are written with mode 600
+6. baseline location warning if placed inside monitored roots
+7. symlink following disabled by default
+8. configuration file hash drift detection
+9. program hash drift detection
+10. strict exit codes for automation and alert pipelines
 
 ### Recommended hardening for operators
 
@@ -298,7 +331,8 @@ Then place the output into the desired cron context.
 1. Baseline signing currently uses a local symmetric key. If key material is compromised, signature trust is compromised.
 2. Program hash checks can detect drift, but do not replace package signature verification.
 3. Email, Slack, and object storage integrations depend on network and external credential security.
-4. scan_updates_baseline true reduces repeated alerts, but also reduces strict persistence of change evidence across scans.
+4. scan_updates_baseline true reduces repeated alerts, but also reduces strict persistence of change evidence across scans. This option is useful for very specific deployments and 
+integrations. Only enable if you understand this and have a very specific use case.
 
 ## Project files
 
