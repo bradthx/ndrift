@@ -348,8 +348,9 @@ def get_file_attrs(path: str) -> str:
         proc = subprocess.run(
             ["lsattr", "-d", path],
             check=False,
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
         )
     except FileNotFoundError:
         return ""
@@ -871,7 +872,13 @@ def send_s3_report(s3_bucket: str, report_path: str, logger: logging.Logger) -> 
     key_name = f"ndrift-reports/{pathlib.Path(report_path).name}.{int(time.time())}.json"
     command = ["aws", "s3", "cp", report_path, f"s3://{s3_bucket}/{key_name}"]
     try:
-        proc = subprocess.run(command, check=False, capture_output=True, text=True)
+        proc = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
     except FileNotFoundError:
         logger.error("AWS CLI is missing, cannot upload report")
         return
