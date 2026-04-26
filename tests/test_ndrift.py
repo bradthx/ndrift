@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+import re
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -168,6 +169,24 @@ class NdriftIntegrationTests(unittest.TestCase):
         cron = run_ndrift(["cron"], self.config_path)
         self.assertEqual(cron.returncode, 0)
         self.assertTrue(cron.stdout.strip().startswith("*/30 * * * *"))
+
+    def test_scan_writes_log_entry_per_run_with_timestamp(self):
+        self._write("index.php", "<?php echo 1;\n")
+        self._init_baseline()
+
+        first = run_ndrift(["scan", str(self.site_dir)], self.config_path)
+        second = run_ndrift(["scan", str(self.site_dir)], self.config_path)
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(second.returncode, 0)
+
+        log_path = Path(self.config_values["log_path"])
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+        scan_lines = [line for line in lines if "Scan completed at" in line]
+
+        self.assertGreaterEqual(len(scan_lines), 2)
+        timestamp_pattern = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} INFO ")
+        for line in scan_lines:
+            self.assertRegex(line, timestamp_pattern)
 
     def test_state_signature_tamper_blocks_state_trust(self):
         self._write("index.php", "<?php echo 1;\n")
