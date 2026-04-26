@@ -11,7 +11,7 @@ ndrift is a lightweight Linux file integrity monitor.
 
 File Integrity Monitoring is a crucial part of any application deployment. If your app files
 are changing, and you are not aware of it, that's a huge problem. I have seen hundreds of 
-examples of sites being compromized for various reasons, and site owners not being aware
+examples of sites being compromised for various reasons, and site owners not being aware
 of it for weeks or even months while in the meantime, client data and pii is being stolen.
 
 FIM is part of just about every modern CNAPP solution, and usually readily available for
@@ -164,35 +164,48 @@ sudo install -o root -g root -m 0600 ./ndrift-config.conf /etc/ndrift/ndrift.con
 
 ## Quick start
 
-### Create baseline
+Use this flow to get ndrift running on a real directory, including cron scheduling.
+
+1. Create the first baseline.
 
 ~~~bash
-/usr/local/bin/ndrift init /path/to/monitor --config /etc/ndrift/ndrift.conf
+sudo /usr/local/bin/ndrift init /path/to/monitor --config /etc/ndrift/ndrift.conf
 ~~~
 
-### Run scan
+2. Run an immediate scan to confirm it works.
 
 ~~~bash
-/usr/local/bin/ndrift scan --config /etc/ndrift/ndrift.conf
+sudo /usr/local/bin/ndrift scan --config /etc/ndrift/ndrift.conf
 ~~~
 
-### Run scan with JSON output
+3. Review the latest report.
 
 ~~~bash
-/usr/local/bin/ndrift scan --json --config /etc/ndrift/ndrift.conf
+sudo /usr/local/bin/ndrift report --config /etc/ndrift/ndrift.conf
 ~~~
 
-### Run continuous watch mode
+4. Install a cron entry manually.
 
 ~~~bash
-/usr/local/bin/ndrift watch --interval 60 --config /etc/ndrift/ndrift.conf
+CRON_LINE="$(sudo /usr/local/bin/ndrift cron --config /etc/ndrift/ndrift.conf)"
+(sudo crontab -l 2>/dev/null; echo "$CRON_LINE") | sudo crontab -
+sudo crontab -l | grep ndrift
 ~~~
 
-### Print latest report
+5. Validate that scans are running from cron.
 
 ~~~bash
-/usr/local/bin/ndrift report --config /etc/ndrift/ndrift.conf
+sudo tail -n 50 /var/log/ndrift/ndrift.log
+sudo /usr/local/bin/ndrift report --config /etc/ndrift/ndrift.conf
 ~~~
+
+6. Optional: run continuous watch mode for debugging.
+
+~~~bash
+sudo /usr/local/bin/ndrift watch --interval 60 --config /etc/ndrift/ndrift.conf
+~~~
+
+If you change cron_schedule in config, run the cron command again and replace the existing crontab entry.
 
 ## Command reference
 
