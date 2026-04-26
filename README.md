@@ -127,9 +127,10 @@ If scan_updates_baseline is true, ndrift updates baseline after each scan.
 ### Requirements
 
 1. Linux
-2. Python 3
-3. optional: lsattr for filesystem attribute checks
-4. optional: AWS CLI for object storage report upload
+2. Python 3.6 or newer
+3. for Python 3.6 only: dataclasses backport package
+4. optional: lsattr for filesystem attribute checks
+5. optional: AWS CLI for object storage report upload
 
 ### Local install in project directory
 
