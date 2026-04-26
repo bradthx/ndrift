@@ -1268,7 +1268,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ndrift",
         description="Lightweight file integrity monitor for Linux",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
+    sub.required = True
 
     init_cmd = sub.add_parser("init", help="create baseline")
     init_cmd.add_argument("directories", nargs="+", help="directories to monitor")
@@ -1338,6 +1339,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     """Main entry point for CLI execution."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "command", None) is None:
+        parser.print_help(sys.stderr)
+        return EXIT_ERROR
     try:
         return dispatch(args)
     except NdriftError as exc:
