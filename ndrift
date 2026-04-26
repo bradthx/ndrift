@@ -1099,9 +1099,21 @@ def run_scan_once(
             print_report_console(report)
 
         if errors and not config.allow_read_errors:
-            return EXIT_ERROR
-        if findings:
-            return EXIT_CHANGES
+            exit_code = EXIT_ERROR
+        elif findings:
+            exit_code = EXIT_CHANGES
+        else:
+            exit_code = EXIT_OK
+
+        logger.info(
+            "Scan completed at %s findings=%s warnings=%s errors=%s exit=%s",
+            report["time"],
+            len(findings),
+            len(warnings),
+            len(errors),
+            exit_code,
+        )
+        return exit_code
     return EXIT_OK
 
 
